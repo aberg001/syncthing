@@ -1,179 +1,135 @@
 #!/usr/bin/env bash
+set -euo pipefail
+IFS=$'\n\t'
 
-export COPYFILE_DISABLE=true
+STTRACE=${STTRACE:-}
 
-distFiles=(README.md LICENSE) # apart from the binary itself
-version=$(git describe --always --dirty)
-date=$(git show -s --format=%ct)
-user=$(whoami)
-host=$(hostname)
-host=${host%%.*}
-ldflags="-w -X main.Version $version -X main.BuildStamp $date -X main.BuildUser $user -X main.BuildHost $host"
-
-check() {
-	if ! command -v godep >/dev/null ; then
-		echo "Error: no godep. Try \"$0 setup\"."
-		exit 1
-	fi
-}
-
-build() {
-	check
-
-	go vet ./...
-
-	godep go build $* -ldflags "$ldflags" ./cmd/syncthing
-}
-
-assets() {
-	check
-	godep go run cmd/assets/assets.go gui > auto/gui.files.go
-}
-
-test() {
-	check
-	godep go test -cpu=1,2,4 ./...
-}
-
-sign() {
-	if git describe --exact-match 2>/dev/null >/dev/null ; then
-		# HEAD is a tag
-		id=BCE524C7
-		if gpg --list-keys "$id" >/dev/null 2>&1 ; then
-			gpg -ab -u "$id" "$1"
-		fi
-	fi
-}
-
-tarDist() {
-	name="$1"
-	rm -rf "$name"
-	mkdir -p "$name"
-	cp syncthing "${distFiles[@]}" "$name"
-	sign "$name/syncthing"
-	tar zcvf "$name.tar.gz" "$name"
-	rm -rf "$name"
-}
-
-zipDist() {
-	name="$1"
-	rm -rf "$name"
-	mkdir -p "$name"
-	cp syncthing.exe "${distFiles[@]}" "$name"
-	sign "$name/syncthing.exe"
-	zip -r "$name.zip" "$name"
-	rm -rf "$name"
-}
-
-deps() {
-	check
-	godep save ./cmd/syncthing ./cmd/assets ./discover/cmd/discosrv
-}
-
-setup() {
-	echo Installing godep...
-	go get -u github.com/tools/godep
-	echo Installing go vet...
-	go get -u code.google.com/p/go.tools/cmd/vet
-}
-
-case "$1" in
-	"")
-		shift
-		build $*
+case "${1:-default}" in
+	default)
+		go run build.go
 		;;
 
-	race)
-		build -race
-		;;
-
-	guidev)
-		build -tags guidev
+	clean)
+		go run build.go "$1"
 		;;
 
 	test)
-		test
+		ulimit -t 60 &>/dev/null || true
+		ulimit -d 512000 &>/dev/null || true
+		ulimit -m 512000 &>/dev/null || true
+
+		go run build.go "$1"
 		;;
 
 	tar)
-		rm -f *.tar.gz *.zip
-		test || exit 1
-		assets
-		build
-
-		eval $(go env)
-		name="syncthing-$GOOS-$GOARCH-$version"
-
-		tarDist "$name"
-		;;
-
-	all)
-		rm -f *.tar.gz *.zip
-		test || exit 1
-		assets
-
-		for os in darwin-amd64 linux-386 linux-amd64 freebsd-amd64 windows-amd64 windows-386 ; do
-			export GOOS=${os%-*}
-			export GOARCH=${os#*-}
-
-			build
-
-			name="syncthing-$os-$version"
-			case $GOOS in
-				windows)
-					zipDist "$name"
-					rm -f syncthing.exe
-					;;
-				*)
-					tarDist "$name"
-					rm -f syncthing
-					;;
-			esac
-		done
-
-		export GOOS=linux
-		export GOARCH=arm
-
-		origldflags="$ldflags"
-
-		export GOARM=7
-		ldflags="$origldflags -X main.GoArchExtra v7"
-		build
-		tarDist "syncthing-linux-armv7-$version"
-
-		export GOARM=6
-		ldflags="$origldflags -X main.GoArchExtra v6"
-		build
-		tarDist "syncthing-linux-armv6-$version"
-
-		export GOARM=5
-		ldflags="$origldflags -X main.GoArchExtra v5"
-		build
-		tarDist "syncthing-linux-armv5-$version"
-
-		;;
-
-	upload)
-		tag=$(git describe)
-		shopt -s nullglob
-		for f in *.tar.gz *.zip *.asc ; do
-			relup calmh/syncthing "$tag" "$f"
-		done
+		go run build.go "$1"
 		;;
 
 	deps)
-		deps
+		go run build.go "$1"
 		;;
 
 	assets)
-		assets
+		go run build.go "$1"
+		;;
+
+	xdr)
+		go run build.go "$1"
+		;;
+
+	translate)
+		go run build.go "$1"
+		;;
+
+	transifex)
+		go run build.go "$1"
+		;;
+
+	noupgrade)
+		go run build.go -no-upgrade tar
+		;;
+
+	all)
+		go run build.go -goos linux -goarch amd64 tar
+		go run build.go -goos linux -goarch 386 tar
+		go run build.go -goos linux -goarch arm tar
+
+		go run build.go -goos freebsd -goarch amd64 tar
+		go run build.go -goos freebsd -goarch 386 tar
+
+		go run build.go -goos openbsd -goarch amd64 tar
+		go run build.go -goos openbsd -goarch 386 tar
+
+		go run build.go -goos darwin -goarch amd64 tar
+
+		go run build.go -goos windows -goarch amd64 zip
+		go run build.go -goos windows -goarch 386 zip
 		;;
 
 	setup)
-		setup
+		echo "Don't worry, just build."
+		;;
+
+	test-cov)
+		ulimit -t 600 &>/dev/null || true
+		ulimit -d 512000 &>/dev/null || true
+		ulimit -m 512000 &>/dev/null || true
+
+		go get github.com/axw/gocov/gocov
+		go get github.com/AlekSi/gocov-xml
+
+		echo "mode: set" > coverage.out
+		fail=0
+
+		# For every package in the repo
+		for dir in $(go list ./...) ; do
+			# run the tests
+			godep go test -coverprofile=profile.out $dir
+			if [ -f profile.out ] ; then
+				# and if there was test output, append it to coverage.out
+				grep -v "mode: set" profile.out >> coverage.out
+				rm profile.out
+			fi
+		done
+
+		gocov convert coverage.out | gocov-xml > coverage.xml
+
+		# This is usually run from within Jenkins. If it is, we need to
+		# tweak the paths in coverage.xml so cobertura finds the
+		# source.
+		if [[ "${WORKSPACE:-default}" != "default" ]] ; then
+			sed "s#$WORKSPACE##g" < coverage.xml > coverage.xml.new && mv coverage.xml.new coverage.xml
+		fi
+		;;
+
+	docker-all)
+		docker run --rm -h syncthing-builder -u $(id -u) -t \
+			-v $(pwd):/go/src/github.com/syncthing/syncthing \
+			-w /go/src/github.com/syncthing/syncthing \
+			-e "STTRACE=$STTRACE" \
+			syncthing/build:latest \
+			sh -c './build.sh clean \
+				&& go vet ./cmd/... ./internal/... \
+				&& ( golint ./cmd/... ; golint ./internal/... ) | egrep -v "comment on exported|should have comment" \
+				&& ./build.sh all \
+				&& STTRACE=all ./build.sh test-cov'
+		;;
+
+	docker-test)
+		docker run --rm -h syncthing-builder -u $(id -u) -t \
+			-v $(pwd):/go/src/github.com/syncthing/syncthing \
+			-w /go/src/github.com/syncthing/syncthing \
+			-e "STTRACE=$STTRACE" \
+			syncthing/build:latest \
+			sh -euxc './build.sh clean \
+				&& go run build.go -race \
+				&& export GOPATH=$(pwd)/Godeps/_workspace:$GOPATH \
+				&& cd test \
+				&& go test -tags integration -v -timeout 60m -short \
+				&& git clean -fxd .'
 		;;
 
 	*)
-		echo "Unknown build parameter $1"
+		echo "Unknown build command $1"
 		;;
 esac
